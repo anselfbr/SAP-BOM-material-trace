@@ -41,7 +41,7 @@ def _read_excel(upload: UploadFile) -> pd.DataFrame:
 def home():
     return {"message": "SAP BOM Material Trace API Running"}
 
-@app.post("/api/trace")
+@app.post("/api/upload")
 async def trace_materials(
     issue_file: UploadFile = File(...),      # 工單耗用
     workorder_file: UploadFile = File(...),   # 工單生產

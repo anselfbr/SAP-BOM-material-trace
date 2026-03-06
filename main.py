@@ -22,6 +22,21 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def find_required_col(df: pd.DataFrame, target_name: str) -> str:
+    """
+    大小寫不敏感、前後空白不敏感地找欄位
+    """
+    normalized = {str(c).strip().lower(): c for c in df.columns}
+    key = target_name.strip().lower()
+    if key in normalized:
+        return normalized[key]
+
+    raise HTTPException(
+        status_code=400,
+        detail=f"缺少必要欄位: {target_name}；實際欄位: {list(df.columns)}"
+    )
+
+
 def read_excel_file(upload: UploadFile) -> pd.DataFrame:
     filename = (upload.filename or "").lower()
 
@@ -67,141 +82,129 @@ async def trace_materials(
         issue_df = read_excel_file(issue_file)
         wo_df = read_excel_file(workorder_file)
 
-        # 2) 寫死對應 SAP 欄位名稱（依你提供的表頭）
-        # 工單耗用檔
-        issue_required_cols = [
-            "Order",
-            "Plant",
-            "Material",
-            "Material Description",
-            "Requirement quantity (EINHEIT)",
-            "Quantity withdrawn (EINHEIT)",
-            "Base Unit of Measure (=EINHEIT)",
-        ]
+        # 2) 工單耗用檔欄位
+        issue_order_col = find_required_col(issue_df, "Order")
+        issue_plant_col = find_required_col(issue_df, "Plant")
+        issue_material_col = find_required_col(issue_df, "Material")
+        issue_material_desc_col = find_required_col(issue_df, "Material Description")
+        issue_req_qty_col = find_required_col(issue_df, "Requirement quantity (EINHEIT)")
+        issue_withdrawn_qty_col = find_required_col(issue_df, "Quantity withdrawn (EINHEIT)")
+        issue_uom_col = find_required_col(issue_df, "Base Unit of Measure (=EINHEIT)")
 
-        # 工單生產檔
-        wo_required_cols = [
-            "Order",
-            "Plant",
-            "Material Number",
-            "Material description",
-            "Order quantity (GMEIN)",
-            "Delivered quantity (GMEIN)",
-        ]
+        # 3) 工單生產檔欄位
+        wo_order_col = find_required_col(wo_df, "Order")
+        wo_plant_col = find_required_col(wo_df, "Plant")
+        wo_product_col = find_required_col(wo_df, "Material Number")
+        wo_product_desc_col = find_required_col(wo_df, "Material description")
+        wo_order_qty_col = find_required_col(wo_df, "Order quantity (GMEIN)")
+        wo_delivered_qty_col = find_required_col(wo_df, "Delivered quantity (GMEIN)")
 
-        missing_issue = [c for c in issue_required_cols if c not in issue_df.columns]
-        missing_wo = [c for c in wo_required_cols if c not in wo_df.columns]
+        # 4) 清理工單號
+        issue_df[issue_order_col] = issue_df[issue_order_col].astype(str).str.strip()
+        wo_df[wo_order_col] = wo_df[wo_order_col].astype(str).str.strip()
 
-        if missing_issue or missing_wo:
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "error": "Excel 欄位名稱不符合預期",
-                    "工單耗用檔缺少欄位": missing_issue,
-                    "工單生產檔缺少欄位": missing_wo,
-                    "工單耗用檔實際欄位": list(issue_df.columns),
-                    "工單生產檔實際欄位": list(wo_df.columns),
-                },
-            )
-
-        # 3) 清理工單號
-        issue_df["Order"] = issue_df["Order"].astype(str).str.strip()
-        wo_df["Order"] = wo_df["Order"].astype(str).str.strip()
-
-        # 4) 數量轉數字
-        issue_df["Requirement Qty Num"] = pd.to_numeric(
-            issue_df["Requirement quantity (EINHEIT)"].astype(str).str.replace(",", "", regex=False).str.strip(),
-            errors="coerce",
+        # 5) 數量欄轉數字
+        issue_df["原物料需求量(數值)"] = pd.to_numeric(
+            issue_df[issue_req_qty_col].astype(str).str.replace(",", "", regex=False).str.strip(),
+            errors="coerce"
         )
 
-        issue_df["Withdrawn Qty Num"] = pd.to_numeric(
-            issue_df["Quantity withdrawn (EINHEIT)"].astype(str).str.replace(",", "", regex=False).str.strip(),
-            errors="coerce",
+        issue_df["原物料實際耗用量(數值)"] = pd.to_numeric(
+            issue_df[issue_withdrawn_qty_col].astype(str).str.replace(",", "", regex=False).str.strip(),
+            errors="coerce"
         )
 
-        wo_df["Order Qty Num"] = pd.to_numeric(
-            wo_df["Order quantity (GMEIN)"].astype(str).str.replace(",", "", regex=False).str.strip(),
-            errors="coerce",
+        wo_df["工單需求數量(數值)"] = pd.to_numeric(
+            wo_df[wo_order_qty_col].astype(str).str.replace(",", "", regex=False).str.strip(),
+            errors="coerce"
         )
 
-        wo_df["Delivered Qty Num"] = pd.to_numeric(
-            wo_df["Delivered quantity (GMEIN)"].astype(str).str.replace(",", "", regex=False).str.strip(),
-            errors="coerce",
+        wo_df["實際完工數量(數值)"] = pd.to_numeric(
+            wo_df[wo_delivered_qty_col].astype(str).str.replace(",", "", regex=False).str.strip(),
+            errors="coerce"
         )
 
-        # 5) 只保留需要欄位
+        # 6) 只保留需要欄位
         issue_small = issue_df[
             [
-                "Order",
-                "Plant",
-                "Material",
-                "Material Description",
-                "Requirement quantity (EINHEIT)",
-                "Quantity withdrawn (EINHEIT)",
-                "Base Unit of Measure (=EINHEIT)",
-                "Requirement Qty Num",
-                "Withdrawn Qty Num",
+                issue_order_col,
+                issue_plant_col,
+                issue_material_col,
+                issue_material_desc_col,
+                issue_req_qty_col,
+                issue_withdrawn_qty_col,
+                issue_uom_col,
+                "原物料需求量(數值)",
+                "原物料實際耗用量(數值)",
             ]
         ].copy()
 
         wo_small = wo_df[
             [
-                "Order",
-                "Plant",
-                "Material Number",
-                "Material description",
-                "Order quantity (GMEIN)",
-                "Delivered quantity (GMEIN)",
-                "Order Qty Num",
-                "Delivered Qty Num",
+                wo_order_col,
+                wo_plant_col,
+                wo_product_col,
+                wo_product_desc_col,
+                wo_order_qty_col,
+                wo_delivered_qty_col,
+                "工單需求數量(數值)",
+                "實際完工數量(數值)",
             ]
         ].copy()
 
-        # 6) 用 Order 關聯
+        # 7) 用 Order 關聯
         merged = wo_small.merge(
             issue_small,
-            on="Order",
+            left_on=wo_order_col,
+            right_on=issue_order_col,
             how="left",
             suffixes=("_wo", "_issue"),
         )
 
-        # 7) 統一輸出欄位
+        # 8) 輸出明細表
         merged_out = pd.DataFrame({
-            "Order": merged["Order"],
-            "Plant": merged["Plant_wo"].fillna(merged["Plant_issue"]),
-            "Product Material Number": merged["Material Number"],
-            "Product Description": merged["Material description"],
-            "工單需求數量": merged["Order quantity (GMEIN)"],
-            "工單需求數量(數值)": merged["Order Qty Num"],
-            "實際完工數量": merged["Delivered quantity (GMEIN)"],
-            "實際完工數量(數值)": merged["Delivered Qty Num"],
-            "Input Material": merged["Material"],
-            "Input Material Description": merged["Material Description"],
-            "原物料需求量": merged["Requirement quantity (EINHEIT)"],
-            "原物料需求量(數值)": merged["Requirement Qty Num"],
-            "原物料實際耗用量": merged["Quantity withdrawn (EINHEIT)"],
-            "原物料實際耗用量(數值)": merged["Withdrawn Qty Num"],
-            "UoM": merged["Base Unit of Measure (=EINHEIT)"],
+            "Order": merged[wo_order_col],
+            "Plant": merged[wo_plant_col].fillna(merged[issue_plant_col]),
+            "Product Material Number": merged[wo_product_col],
+            "Product Description": merged[wo_product_desc_col],
+            "工單需求數量": merged[wo_order_qty_col],
+            "工單需求數量(數值)": merged["工單需求數量(數值)"],
+            "實際完工數量": merged[wo_delivered_qty_col],
+            "實際完工數量(數值)": merged["實際完工數量(數值)"],
+            "Input Material": merged[issue_material_col],
+            "Input Material Description": merged[issue_material_desc_col],
+            "原物料需求量": merged[issue_req_qty_col],
+            "原物料需求量(數值)": merged["原物料需求量(數值)"],
+            "原物料實際耗用量": merged[issue_withdrawn_qty_col],
+            "原物料實際耗用量(數值)": merged["原物料實際耗用量(數值)"],
+            "UoM": merged[issue_uom_col],
         })
 
-        # 8) 明細表排序
         merged_out = merged_out.sort_values(
             by=["Order", "Product Material Number", "Input Material"],
             na_position="last"
         )
 
-        # 9) 彙總表：每工單/成品/原物料彙總實際耗用量
-        summary = (
+        # 9) 原物料彙總
+        trace_summary = (
             merged_out
             .dropna(subset=["Input Material"])
             .groupby(
-                ["Order", "Plant", "Product Material Number", "Product Description", "Input Material", "Input Material Description", "UoM"],
+                [
+                    "Order",
+                    "Plant",
+                    "Product Material Number",
+                    "Product Description",
+                    "Input Material",
+                    "Input Material Description",
+                    "UoM",
+                ],
                 as_index=False
             )[["原物料需求量(數值)", "原物料實際耗用量(數值)"]]
             .sum()
         )
 
-        # 10) 產品層級彙總：每工單對應成品資訊
+        # 10) 成品工單彙總
         product_summary = (
             merged_out[
                 [
@@ -223,7 +226,7 @@ async def trace_materials(
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
             merged_out.to_excel(writer, index=False, sheet_name="trace_detail")
-            summary.to_excel(writer, index=False, sheet_name="trace_summary")
+            trace_summary.to_excel(writer, index=False, sheet_name="trace_summary")
             product_summary.to_excel(writer, index=False, sheet_name="product_summary")
 
         output.seek(0)

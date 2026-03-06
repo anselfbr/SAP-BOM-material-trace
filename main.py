@@ -214,19 +214,22 @@ async def trace_materials(
             rename_map[issue_plant_col] = "Plant"
 
         merged_out = merged.rename(columns=rename_map)
-        merged_out["Input Qty (num)"] = merged_out["_qty_num"]
 
-        # 只刪除中間欄位，不要把真正的 Order 刪掉
-        drop_cols = ["_qty_num"]
+        # 補數量欄
+        if "_qty_num" in merged_out.columns:
+            merged_out["Input Qty (num)"] = merged_out["_qty_num"]
 
-        # 只有在 issue_order_col 不是最終輸出的 Order 時，才刪
+        # 9) 刪除中間欄位，但不能誤刪最終的 Order
+        drop_cols = []
+        if "_qty_num" in merged_out.columns:
+            drop_cols.append("_qty_num")
+
         if issue_order_col != "Order" and issue_order_col in merged_out.columns:
-        drop_cols.append(issue_order_col)
+            drop_cols.append(issue_order_col)
 
         merged_out = merged_out.drop(columns=drop_cols, errors="ignore")
-        )
 
-        # 9) 欄位順序
+        # 10) 欄位順序
         preferred_order = [
             "Order",
             "Plant",
@@ -244,11 +247,17 @@ async def trace_materials(
         ]
         merged_out = merged_out[final_cols]
 
-        # 10) 彙總表
+        # 11) 彙總表
         summary_group_cols = [
             c for c in ["Order", "Plant", "Product Material Number", "Input Material", "UoM"]
             if c in merged_out.columns
         ]
+
+        if not summary_group_cols:
+            raise HTTPException(
+                status_code=500,
+                detail=f"找不到 summary 分組欄位，現有欄位: {list(merged_out.columns)}"
+            )
 
         if "Input Qty (num)" in merged_out.columns:
             summary = (
@@ -266,7 +275,7 @@ async def trace_materials(
                 .rename(columns={"size": "Rows"})
             )
 
-        # 11) 輸出 Excel
+        # 12) 輸出 Excel
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
             merged_out.to_excel(writer, index=False, sheet_name="trace_detail")
@@ -274,7 +283,7 @@ async def trace_materials(
 
         output.seek(0)
 
-        # 12) 回傳下載
+        # 13) 回傳下載
         filename = "sap_bom_material_trace.xlsx"
         return StreamingResponse(
             output,

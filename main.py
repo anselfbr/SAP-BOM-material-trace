@@ -17,14 +17,12 @@ app.add_middleware(
 
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """清理欄位名稱空白"""
     df = df.copy()
     df.columns = [re.sub(r"\s+", " ", str(c).strip()) for c in df.columns]
     return df
 
 
 def read_excel_file(upload: UploadFile) -> pd.DataFrame:
-    """讀取 Excel 檔"""
     filename = (upload.filename or "").lower()
 
     if not (filename.endswith(".xlsx") or filename.endswith(".xls")):
@@ -44,7 +42,6 @@ def read_excel_file(upload: UploadFile) -> pd.DataFrame:
 
 
 def find_required_col(df: pd.DataFrame, target_name: str) -> str:
-    """大小寫不敏感找欄位"""
     col_map = {str(c).strip().lower(): c for c in df.columns}
     key = target_name.strip().lower()
 
@@ -79,11 +76,11 @@ async def trace_materials(
     workorder_file: UploadFile = File(..., description="工單生產檔：請上傳工單生產 Excel"),
 ):
     try:
-        # 1) 讀檔
+        # 1) 讀取 Excel
         issue_df = read_excel_file(issue_file)
         wo_df = read_excel_file(workorder_file)
 
-        # 2) 工單耗用檔欄位（依你提供的表頭）
+        # 2) 工單耗用檔欄位
         issue_order_col = find_required_col(issue_df, "Order")
         issue_plant_col = find_required_col(issue_df, "Plant")
         issue_material_col = find_required_col(issue_df, "Material")
@@ -92,7 +89,7 @@ async def trace_materials(
         issue_withdrawn_qty_col = find_required_col(issue_df, "Quantity withdrawn (EINHEIT)")
         issue_uom_col = find_required_col(issue_df, "Base Unit of Measure (=EINHEIT)")
 
-        # 3) 工單生產檔欄位（依你提供的表頭）
+        # 3) 工單生產檔欄位
         wo_order_col = find_required_col(wo_df, "Order")
         wo_plant_col = find_required_col(wo_df, "Plant")
         wo_product_col = find_required_col(wo_df, "Material Number")
@@ -100,11 +97,11 @@ async def trace_materials(
         wo_order_qty_col = find_required_col(wo_df, "Order quantity (GMEIN)")
         wo_delivered_qty_col = find_required_col(wo_df, "Delivered quantity (GMEIN)")
 
-        # 4) 清理工單號
+        # 4) 清理 Order
         issue_df[issue_order_col] = issue_df[issue_order_col].astype(str).str.strip()
         wo_df[wo_order_col] = wo_df[wo_order_col].astype(str).str.strip()
 
-        # 5) 數量欄轉數字
+        # 5) 轉數值
         issue_df["原物料需求量(數值)"] = pd.to_numeric(
             issue_df[issue_req_qty_col].astype(str).str.replace(",", "", regex=False).str.strip(),
             errors="coerce"
@@ -150,32 +147,54 @@ async def trace_materials(
             ]
         ].copy()
 
-        # 7) 用 Order 關聯
-        merged = wo_small.merge(
-            issue_small,
-            left_on=wo_order_col,
-            right_on=issue_order_col,
-            how="left",
-            suffixes=("_wo", "_issue"),
+        # 7) 統一欄位名稱後再 merge，避免 Plant / Order suffix 問題
+        issue_small = issue_small.rename(
+            columns={
+                issue_order_col: "Order",
+                issue_plant_col: "Issue Plant",
+                issue_material_col: "Input Material",
+                issue_material_desc_col: "Input Material Description",
+                issue_req_qty_col: "原物料需求量",
+                issue_withdrawn_qty_col: "原物料實際耗用量",
+                issue_uom_col: "UoM",
+            }
         )
 
-        # 8) 明細表
+        wo_small = wo_small.rename(
+            columns={
+                wo_order_col: "Order",
+                wo_plant_col: "Plant",
+                wo_product_col: "Product Material Number",
+                wo_product_desc_col: "Product Description",
+                wo_order_qty_col: "工單需求數量",
+                wo_delivered_qty_col: "實際完工數量",
+            }
+        )
+
+        # 8) 用 Order 關聯
+        merged = wo_small.merge(
+            issue_small,
+            on="Order",
+            how="left",
+        )
+
+        # 9) 輸出明細表
         merged_out = pd.DataFrame({
-            "Order": merged[wo_order_col],
-            "Plant": merged[wo_plant_col].fillna(merged[issue_plant_col]),
-            "Product Material Number": merged[wo_product_col],
-            "Product Description": merged[wo_product_desc_col],
-            "工單需求數量": merged[wo_order_qty_col],
+            "Order": merged["Order"],
+            "Plant": merged["Plant"].fillna(merged.get("Issue Plant")),
+            "Product Material Number": merged["Product Material Number"],
+            "Product Description": merged["Product Description"],
+            "工單需求數量": merged["工單需求數量"],
             "工單需求數量(數值)": merged["工單需求數量(數值)"],
-            "實際完工數量": merged[wo_delivered_qty_col],
+            "實際完工數量": merged["實際完工數量"],
             "實際完工數量(數值)": merged["實際完工數量(數值)"],
-            "Input Material": merged[issue_material_col],
-            "Input Material Description": merged[issue_material_desc_col],
-            "原物料需求量": merged[issue_req_qty_col],
+            "Input Material": merged["Input Material"],
+            "Input Material Description": merged["Input Material Description"],
+            "原物料需求量": merged["原物料需求量"],
             "原物料需求量(數值)": merged["原物料需求量(數值)"],
-            "原物料實際耗用量": merged[issue_withdrawn_qty_col],
+            "原物料實際耗用量": merged["原物料實際耗用量"],
             "原物料實際耗用量(數值)": merged["原物料實際耗用量(數值)"],
-            "UoM": merged[issue_uom_col],
+            "UoM": merged["UoM"],
         })
 
         merged_out = merged_out.sort_values(
@@ -183,7 +202,7 @@ async def trace_materials(
             na_position="last"
         )
 
-        # 9) 原物料彙總
+        # 10) 原物料彙總
         trace_summary = (
             merged_out
             .dropna(subset=["Input Material"])
@@ -202,7 +221,7 @@ async def trace_materials(
             .sum()
         )
 
-        # 10) 成品工單彙總
+        # 11) 成品工單彙總
         product_summary = (
             merged_out[
                 [
@@ -220,7 +239,7 @@ async def trace_materials(
             .sort_values(by=["Order", "Product Material Number"])
         )
 
-        # 11) 輸出 Excel
+        # 12) 輸出 Excel
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
             merged_out.to_excel(writer, index=False, sheet_name="trace_detail")
@@ -229,7 +248,7 @@ async def trace_materials(
 
         output.seek(0)
 
-        # 12) 回傳下載
+        # 13) 回傳下載
         return StreamingResponse(
             output,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

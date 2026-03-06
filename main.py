@@ -1,4 +1,5 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import pandas as pd
 import io
@@ -6,156 +7,279 @@ import re
 
 app = FastAPI(title="SAP BOM Material Trace API")
 
-def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    # 去掉欄名空白、統一大小寫、把多餘空白壓成一個
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df.columns = [
-        re.sub(r"\s+", " ", str(c).strip())
-        for c in df.columns
-    ]
+    df.columns = [re.sub(r"\s+", " ", str(c).strip()) for c in df.columns]
     return df
 
-def _find_col(df: pd.DataFrame, candidates: list[str]) -> str:
-    cols = {c.lower(): c for c in df.columns}
+
+def find_col(df: pd.DataFrame, candidates: list[str]) -> str:
+    col_map = {str(c).strip().lower(): c for c in df.columns}
     for cand in candidates:
-        key = cand.lower()
-        if key in cols:
-            return cols[key]
+        key = cand.strip().lower()
+        if key in col_map:
+            return col_map[key]
     return ""
 
-def _read_excel(upload: UploadFile) -> pd.DataFrame:
-    # 只支援 xlsx/xls
-    name = (upload.filename or "").lower()
-    if not (name.endswith(".xlsx") or name.endswith(".xls")):
-        raise HTTPException(status_code=400, detail=f"File must be .xlsx/.xls: {upload.filename}")
+
+def read_excel_file(upload: UploadFile) -> pd.DataFrame:
+    filename = (upload.filename or "").lower()
+    if not (filename.endswith(".xlsx") or filename.endswith(".xls")):
+        raise HTTPException(
+            status_code=400,
+            detail=f"檔案格式錯誤，請上傳 Excel 檔 (.xlsx/.xls)：{upload.filename}"
+        )
 
     try:
-        # 注意：UploadFile.file 是 file-like，可直接給 pandas
-        df = pd.read_excel(upload.file, dtype=str)  # dtype=str 避免料號被轉科學記號
-        df = _normalize_columns(df)
-        return df
+        df = pd.read_excel(upload.file, dtype=str)
+        return normalize_columns(df)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to read Excel {upload.filename}: {e}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"無法讀取 Excel 檔 {upload.filename}：{str(e)}"
+        )
+
 
 @app.get("/")
 def home():
     return {"message": "SAP BOM Material Trace API Running"}
 
-@app.post("/api/upload")
+
+@app.post(
+    "/api/upload",
+    response_class=StreamingResponse,
+    responses={
+        200: {
+            "content": {
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {}
+            },
+            "description": "Download Excel result",
+        }
+    },
+)
 async def trace_materials(
-    issue_file: UploadFile = File(...),      # 工單耗用
-    workorder_file: UploadFile = File(...),   # 工單生產
+    issue_file: UploadFile = File(
+        ...,
+        alias="工單耗用檔",
+        description="請上傳工單耗用 Excel"
+    ),
+    workorder_file: UploadFile = File(
+        ...,
+        alias="工單生產檔",
+        description="請上傳工單生產 Excel"
+    ),
 ):
-    # 1) 讀檔
-    issue_df = _read_excel(issue_file)
-    wo_df = _read_excel(workorder_file)
+    try:
+        # 1) 讀取 Excel
+        issue_df = read_excel_file(issue_file)
+        wo_df = read_excel_file(workorder_file)
 
-    # 2) 找欄位（容錯：不同公司匯出欄名可能略有差）
-    issue_order_col = _find_col(issue_df, ["Order", "order", "工單"])
-    issue_material_col = _find_col(issue_df, ["Material", "material", "原物料", "Component"])
-    issue_qty_col = _find_col(issue_df, [
-        "Quantity withdrawn (EINHEIT)",
-        "Quantity withdrawn",
-        "Qty withdrawn",
-        "quantity withdrawn",
-        "耗用量",
-        "Issued quantity"
-    ])
+        # 2) 自動辨識欄位
+        issue_order_col = find_col(issue_df, ["Order", "order", "工單"])
+        issue_material_col = find_col(issue_df, ["Material", "material", "原物料", "Component"])
+        issue_desc_col = find_col(issue_df, [
+            "Material Description", "material description", "Description", "description", "物料說明"
+        ])
+        issue_qty_col = find_col(issue_df, [
+            "Quantity withdrawn (EINHEIT)",
+            "Quantity withdrawn",
+            "Qty withdrawn",
+            "quantity withdrawn",
+            "Issued quantity",
+            "Requirement quantity (EINHEIT)",
+            "Requirement quantity",
+            "耗用量",
+            "需求量"
+        ])
+        issue_uom_col = find_col(issue_df, [
+            "Base Unit of Measure (=EINHEIT)",
+            "Base Unit of Measure",
+            "UoM",
+            "Unit",
+            "單位"
+        ])
+        issue_vendor_col = find_col(issue_df, ["Vendor", "vendor", "供應商"])
+        issue_plant_col = find_col(issue_df, ["Plant", "plant", "工廠"])
 
-    wo_order_col = _find_col(wo_df, ["Order", "order", "工單"])
-    wo_product_col = _find_col(wo_df, ["Material Number", "Material number", "material number", "產品料號", "Material"])
+        wo_order_col = find_col(wo_df, ["Order", "order", "工單"])
+        wo_product_col = find_col(wo_df, [
+            "Material Number",
+            "Material number",
+            "material number",
+            "Material",
+            "material",
+            "產品料號",
+            "成品料號"
+        ])
+        wo_product_desc_col = find_col(wo_df, [
+            "Material Description", "material description", "Description", "description", "產品說明", "成品說明"
+        ])
+        wo_plant_col = find_col(wo_df, ["Plant", "plant", "工廠"])
 
-    missing = []
-    if not issue_order_col: missing.append("issue_file: Order")
-    if not issue_material_col: missing.append("issue_file: Material")
-    if not wo_order_col: missing.append("workorder_file: Order")
-    if not wo_product_col: missing.append("workorder_file: Material Number (product)")
+        # 3) 檢查必要欄位
+        missing = []
+        if not issue_order_col:
+            missing.append("工單耗用檔缺少欄位：Order")
+        if not issue_material_col:
+            missing.append("工單耗用檔缺少欄位：Material")
+        if not wo_order_col:
+            missing.append("工單生產檔缺少欄位：Order")
+        if not wo_product_col:
+            missing.append("工單生產檔缺少欄位：Material Number / Material")
 
-    if missing:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "error": "Missing required columns",
-                "missing": missing,
-                "issue_columns": list(issue_df.columns),
-                "workorder_columns": list(wo_df.columns),
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "缺少必要欄位",
+                    "missing": missing,
+                    "工單耗用檔欄位": list(issue_df.columns),
+                    "工單生產檔欄位": list(wo_df.columns),
+                },
+            )
+
+        # 4) 清理 Order
+        issue_df[issue_order_col] = issue_df[issue_order_col].astype(str).str.strip()
+        wo_df[wo_order_col] = wo_df[wo_order_col].astype(str).str.strip()
+
+        # 5) 數量欄轉數字
+        if issue_qty_col:
+            issue_df["_qty_num"] = pd.to_numeric(
+                issue_df[issue_qty_col].astype(str).str.replace(",", "", regex=False).str.strip(),
+                errors="coerce"
+            )
+        else:
+            issue_df["_qty_num"] = pd.NA
+
+        # 6) 保留必要欄位
+        issue_keep = [issue_order_col, issue_material_col]
+        if issue_desc_col:
+            issue_keep.append(issue_desc_col)
+        if issue_qty_col:
+            issue_keep.append(issue_qty_col)
+        if issue_uom_col:
+            issue_keep.append(issue_uom_col)
+        if issue_vendor_col:
+            issue_keep.append(issue_vendor_col)
+        if issue_plant_col:
+            issue_keep.append(issue_plant_col)
+        issue_keep.append("_qty_num")
+
+        wo_keep = [wo_order_col, wo_product_col]
+        if wo_product_desc_col:
+            wo_keep.append(wo_product_desc_col)
+        if wo_plant_col:
+            wo_keep.append(wo_plant_col)
+
+        issue_small = issue_df[issue_keep].copy()
+        wo_small = wo_df[wo_keep].copy()
+
+        # 7) 用 Order 關聯
+        merged = wo_small.merge(
+            issue_small,
+            left_on=wo_order_col,
+            right_on=issue_order_col,
+            how="left",
+            suffixes=("_wo", "_issue"),
+        )
+
+        # 8) 重新命名欄位
+        rename_map = {
+            wo_order_col: "Order",
+            wo_product_col: "Product Material Number",
+            issue_material_col: "Input Material",
+        }
+        if wo_product_desc_col:
+            rename_map[wo_product_desc_col] = "Product Description"
+        if issue_desc_col:
+            rename_map[issue_desc_col] = "Input Material Description"
+        if issue_qty_col:
+            rename_map[issue_qty_col] = "Input Qty (raw)"
+        if issue_uom_col:
+            rename_map[issue_uom_col] = "UoM"
+        if issue_vendor_col:
+            rename_map[issue_vendor_col] = "Vendor"
+        if wo_plant_col:
+            rename_map[wo_plant_col] = "Plant"
+        elif issue_plant_col:
+            rename_map[issue_plant_col] = "Plant"
+
+        merged_out = merged.rename(columns=rename_map)
+        merged_out["Input Qty (num)"] = merged_out["_qty_num"]
+
+        merged_out = merged_out.drop(
+            columns=[c for c in [issue_order_col, "_qty_num"] if c in merged_out.columns],
+            errors="ignore"
+        )
+
+        # 9) 欄位順序
+        preferred_order = [
+            "Order",
+            "Plant",
+            "Product Material Number",
+            "Product Description",
+            "Input Material",
+            "Input Material Description",
+            "Input Qty (raw)",
+            "Input Qty (num)",
+            "UoM",
+            "Vendor",
+        ]
+        final_cols = [c for c in preferred_order if c in merged_out.columns] + [
+            c for c in merged_out.columns if c not in preferred_order
+        ]
+        merged_out = merged_out[final_cols]
+
+        # 10) 彙總表
+        summary_group_cols = [
+            c for c in ["Order", "Plant", "Product Material Number", "Input Material", "UoM"]
+            if c in merged_out.columns
+        ]
+
+        if "Input Qty (num)" in merged_out.columns:
+            summary = (
+                merged_out
+                .dropna(subset=["Input Material"])
+                .groupby(summary_group_cols, as_index=False)["Input Qty (num)"]
+                .sum()
+            )
+        else:
+            summary = (
+                merged_out
+                .dropna(subset=["Input Material"])
+                .groupby(summary_group_cols, as_index=False)
+                .size()
+                .rename(columns={"size": "Rows"})
+            )
+
+        # 11) 輸出 Excel
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            merged_out.to_excel(writer, index=False, sheet_name="trace_detail")
+            summary.to_excel(writer, index=False, sheet_name="trace_summary")
+
+        output.seek(0)
+
+        # 12) 回傳下載
+        filename = "sap_bom_material_trace.xlsx"
+        return StreamingResponse(
+            output,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"'
             },
         )
 
-    # 3) 清理資料型別 / 去空白
-    issue_df[issue_order_col] = issue_df[issue_order_col].astype(str).str.strip()
-    wo_df[wo_order_col] = wo_df[wo_order_col].astype(str).str.strip()
-
-    # quantity（如果有）轉成數字方便彙總
-    if issue_qty_col:
-        issue_df[issue_qty_col] = (
-            issue_df[issue_qty_col]
-            .astype(str).str.replace(",", "", regex=False).str.strip()
-        )
-        issue_df["_qty_num"] = pd.to_numeric(issue_df[issue_qty_col], errors="coerce")
-    else:
-        issue_df["_qty_num"] = pd.NA
-
-    # 4) 只留需要欄位
-    issue_keep = [issue_order_col, issue_material_col]
-    if issue_qty_col:
-        issue_keep.append(issue_qty_col)
-    issue_keep.append("_qty_num")
-    issue_small = issue_df[issue_keep].copy()
-
-    wo_small = wo_df[[wo_order_col, wo_product_col]].copy()
-
-    # 5) 用 Order join：每個工單的產品料號 對上 該工單耗用的原物料
-    merged = wo_small.merge(
-        issue_small,
-        left_on=wo_order_col,
-        right_on=issue_order_col,
-        how="left",
-        suffixes=("_wo", "_issue"),
-    )
-
-    # 6) 整理輸出欄位名稱
-    merged_out = merged.rename(columns={
-        wo_order_col: "Order",
-        wo_product_col: "Product Material Number",
-        issue_material_col: "Input Material",
-    })
-
-    if issue_qty_col:
-        merged_out = merged_out.rename(columns={issue_qty_col: "Input Qty (raw)"})
-    else:
-        merged_out["Input Qty (raw)"] = ""
-
-    merged_out["Input Qty (num)"] = merged_out["_qty_num"]
-    merged_out = merged_out.drop(columns=[c for c in merged_out.columns if c in [issue_order_col, "_qty_num"]], errors="ignore")
-
-    # 7) Summary：每個 Order + 產品，彙總原物料用量（如果有數量）
-    if issue_qty_col:
-        summary = (
-            merged_out
-            .dropna(subset=["Input Material"])
-            .groupby(["Order", "Product Material Number", "Input Material"], as_index=False)["Input Qty (num)"]
-            .sum()
-        )
-    else:
-        summary = (
-            merged_out
-            .dropna(subset=["Input Material"])
-            .groupby(["Order", "Product Material Number", "Input Material"], as_index=False)
-            .size()
-            .rename(columns={"size": "Rows"})
-        )
-
-    # 8) 寫 Excel 到記憶體並回傳下載
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-    merged_out.to_excel(writer, index=False, sheet_name="trace_detail")
-    summary.to_excel(writer, index=False, sheet_name="trace_summary")
-
-    output.seek(0)
-    filename = "sap_bom_material_trace.xlsx"
-    return StreamingResponse(
-        output,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-    )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

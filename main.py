@@ -67,28 +67,16 @@ def home():
     },
 )
 async def trace_materials(
-    issue_file: UploadFile = File(
-        ...,
-        alias="工單耗用檔",
-        description="請上傳工單耗用 Excel"
-    ),
-    workorder_file: UploadFile = File(
-        ...,
-        alias="工單生產檔",
-        description="請上傳工單生產 Excel"
-    ),
+    issue_file: UploadFile = File(..., alias="工單耗用檔", description="請上傳工單耗用 Excel"),
+    workorder_file: UploadFile = File(..., alias="工單生產檔", description="請上傳工單生產 Excel"),
 ):
     try:
-        # 1) 讀取 Excel
         issue_df = read_excel_file(issue_file)
         wo_df = read_excel_file(workorder_file)
 
-        # 2) 自動辨識欄位
         issue_order_col = find_col(issue_df, ["Order", "order", "工單"])
         issue_material_col = find_col(issue_df, ["Material", "material", "原物料", "Component"])
-        issue_desc_col = find_col(issue_df, [
-            "Material Description", "material description", "Description", "description", "物料說明"
-        ])
+        issue_desc_col = find_col(issue_df, ["Material Description", "material description", "Description", "description", "物料說明"])
         issue_qty_col = find_col(issue_df, [
             "Quantity withdrawn (EINHEIT)",
             "Quantity withdrawn",
@@ -100,32 +88,15 @@ async def trace_materials(
             "耗用量",
             "需求量"
         ])
-        issue_uom_col = find_col(issue_df, [
-            "Base Unit of Measure (=EINHEIT)",
-            "Base Unit of Measure",
-            "UoM",
-            "Unit",
-            "單位"
-        ])
+        issue_uom_col = find_col(issue_df, ["Base Unit of Measure (=EINHEIT)", "Base Unit of Measure", "UoM", "Unit", "單位"])
         issue_vendor_col = find_col(issue_df, ["Vendor", "vendor", "供應商"])
         issue_plant_col = find_col(issue_df, ["Plant", "plant", "工廠"])
 
         wo_order_col = find_col(wo_df, ["Order", "order", "工單"])
-        wo_product_col = find_col(wo_df, [
-            "Material Number",
-            "Material number",
-            "material number",
-            "Material",
-            "material",
-            "產品料號",
-            "成品料號"
-        ])
-        wo_product_desc_col = find_col(wo_df, [
-            "Material Description", "material description", "Description", "description", "產品說明", "成品說明"
-        ])
+        wo_product_col = find_col(wo_df, ["Material Number", "Material number", "material number", "Material", "material", "產品料號", "成品料號"])
+        wo_product_desc_col = find_col(wo_df, ["Material Description", "material description", "Description", "description", "產品說明", "成品說明"])
         wo_plant_col = find_col(wo_df, ["Plant", "plant", "工廠"])
 
-        # 3) 檢查必要欄位
         missing = []
         if not issue_order_col:
             missing.append("工單耗用檔缺少欄位：Order")
@@ -147,11 +118,9 @@ async def trace_materials(
                 },
             )
 
-        # 4) 清理 Order
         issue_df[issue_order_col] = issue_df[issue_order_col].astype(str).str.strip()
         wo_df[wo_order_col] = wo_df[wo_order_col].astype(str).str.strip()
 
-        # 5) 數量欄轉數字
         if issue_qty_col:
             issue_df["_qty_num"] = pd.to_numeric(
                 issue_df[issue_qty_col].astype(str).str.replace(",", "", regex=False).str.strip(),
@@ -160,7 +129,6 @@ async def trace_materials(
         else:
             issue_df["_qty_num"] = pd.NA
 
-        # 6) 保留必要欄位
         issue_keep = [issue_order_col, issue_material_col]
         if issue_desc_col:
             issue_keep.append(issue_desc_col)
@@ -183,7 +151,6 @@ async def trace_materials(
         issue_small = issue_df[issue_keep].copy()
         wo_small = wo_df[wo_keep].copy()
 
-        # 7) 用 Order 關聯
         merged = wo_small.merge(
             issue_small,
             left_on=wo_order_col,
@@ -192,7 +159,6 @@ async def trace_materials(
             suffixes=("_wo", "_issue"),
         )
 
-        # 8) 重新命名欄位
         rename_map = {
             wo_order_col: "Order",
             wo_product_col: "Product Material Number",
@@ -215,21 +181,17 @@ async def trace_materials(
 
         merged_out = merged.rename(columns=rename_map)
 
-        # 補數量欄
         if "_qty_num" in merged_out.columns:
             merged_out["Input Qty (num)"] = merged_out["_qty_num"]
 
-        # 9) 刪除中間欄位，但不能誤刪最終的 Order
         drop_cols = []
         if "_qty_num" in merged_out.columns:
             drop_cols.append("_qty_num")
-
         if issue_order_col != "Order" and issue_order_col in merged_out.columns:
             drop_cols.append(issue_order_col)
 
         merged_out = merged_out.drop(columns=drop_cols, errors="ignore")
 
-        # 10) 欄位順序
         preferred_order = [
             "Order",
             "Plant",
@@ -247,17 +209,13 @@ async def trace_materials(
         ]
         merged_out = merged_out[final_cols]
 
-        # 11) 彙總表
         summary_group_cols = [
             c for c in ["Order", "Plant", "Product Material Number", "Input Material", "UoM"]
             if c in merged_out.columns
         ]
 
         if not summary_group_cols:
-            raise HTTPException(
-                status_code=500,
-                detail=f"找不到 summary 分組欄位，現有欄位: {list(merged_out.columns)}"
-            )
+            raise HTTPException(status_code=500, detail=f"找不到 summary 分組欄位，現有欄位: {list(merged_out.columns)}")
 
         if "Input Qty (num)" in merged_out.columns:
             summary = (
@@ -275,7 +233,6 @@ async def trace_materials(
                 .rename(columns={"size": "Rows"})
             )
 
-        # 12) 輸出 Excel
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
             merged_out.to_excel(writer, index=False, sheet_name="trace_detail")
@@ -283,14 +240,10 @@ async def trace_materials(
 
         output.seek(0)
 
-        # 13) 回傳下載
-        filename = "sap_bom_material_trace.xlsx"
         return StreamingResponse(
             output,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={
-                "Content-Disposition": f'attachment; filename="{filename}"'
-            },
+            headers={"Content-Disposition": 'attachment; filename="sap_bom_material_trace.xlsx"'},
         )
 
     except HTTPException:

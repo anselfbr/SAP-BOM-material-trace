@@ -17,27 +17,14 @@ app.add_middleware(
 
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """清理欄位名稱空白"""
     df = df.copy()
     df.columns = [re.sub(r"\s+", " ", str(c).strip()) for c in df.columns]
     return df
 
 
-def find_required_col(df: pd.DataFrame, target_name: str) -> str:
-    """
-    大小寫不敏感、前後空白不敏感地找欄位
-    """
-    normalized = {str(c).strip().lower(): c for c in df.columns}
-    key = target_name.strip().lower()
-    if key in normalized:
-        return normalized[key]
-
-    raise HTTPException(
-        status_code=400,
-        detail=f"缺少必要欄位: {target_name}；實際欄位: {list(df.columns)}"
-    )
-
-
 def read_excel_file(upload: UploadFile) -> pd.DataFrame:
+    """讀取 Excel 檔"""
     filename = (upload.filename or "").lower()
 
     if not (filename.endswith(".xlsx") or filename.endswith(".xls")):
@@ -54,6 +41,20 @@ def read_excel_file(upload: UploadFile) -> pd.DataFrame:
             status_code=400,
             detail=f"無法讀取 Excel 檔 {upload.filename}：{str(e)}"
         )
+
+
+def find_required_col(df: pd.DataFrame, target_name: str) -> str:
+    """大小寫不敏感找欄位"""
+    col_map = {str(c).strip().lower(): c for c in df.columns}
+    key = target_name.strip().lower()
+
+    if key in col_map:
+        return col_map[key]
+
+    raise HTTPException(
+        status_code=400,
+        detail=f"缺少必要欄位：{target_name}；實際欄位：{list(df.columns)}"
+    )
 
 
 @app.get("/")
@@ -82,7 +83,7 @@ async def trace_materials(
         issue_df = read_excel_file(issue_file)
         wo_df = read_excel_file(workorder_file)
 
-        # 2) 工單耗用檔欄位
+        # 2) 工單耗用檔欄位（依你提供的表頭）
         issue_order_col = find_required_col(issue_df, "Order")
         issue_plant_col = find_required_col(issue_df, "Plant")
         issue_material_col = find_required_col(issue_df, "Material")
@@ -91,7 +92,7 @@ async def trace_materials(
         issue_withdrawn_qty_col = find_required_col(issue_df, "Quantity withdrawn (EINHEIT)")
         issue_uom_col = find_required_col(issue_df, "Base Unit of Measure (=EINHEIT)")
 
-        # 3) 工單生產檔欄位
+        # 3) 工單生產檔欄位（依你提供的表頭）
         wo_order_col = find_required_col(wo_df, "Order")
         wo_plant_col = find_required_col(wo_df, "Plant")
         wo_product_col = find_required_col(wo_df, "Material Number")
@@ -108,23 +109,20 @@ async def trace_materials(
             issue_df[issue_req_qty_col].astype(str).str.replace(",", "", regex=False).str.strip(),
             errors="coerce"
         )
-
         issue_df["原物料實際耗用量(數值)"] = pd.to_numeric(
             issue_df[issue_withdrawn_qty_col].astype(str).str.replace(",", "", regex=False).str.strip(),
             errors="coerce"
         )
-
         wo_df["工單需求數量(數值)"] = pd.to_numeric(
             wo_df[wo_order_qty_col].astype(str).str.replace(",", "", regex=False).str.strip(),
             errors="coerce"
         )
-
         wo_df["實際完工數量(數值)"] = pd.to_numeric(
             wo_df[wo_delivered_qty_col].astype(str).str.replace(",", "", regex=False).str.strip(),
             errors="coerce"
         )
 
-        # 6) 只保留需要欄位
+        # 6) 只保留必要欄位
         issue_small = issue_df[
             [
                 issue_order_col,
@@ -161,7 +159,7 @@ async def trace_materials(
             suffixes=("_wo", "_issue"),
         )
 
-        # 8) 輸出明細表
+        # 8) 明細表
         merged_out = pd.DataFrame({
             "Order": merged[wo_order_col],
             "Plant": merged[wo_plant_col].fillna(merged[issue_plant_col]),

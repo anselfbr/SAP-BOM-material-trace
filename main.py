@@ -1,6 +1,6 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 import pandas as pd
 import io
 import re
@@ -15,6 +15,19 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# 每個 request 都印出來
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    print(f"=== REQUEST START === {request.method} {request.url.path}")
+    try:
+        response = await call_next(request)
+        print(f"=== REQUEST END === {request.method} {request.url.path} -> {response.status_code}")
+        return response
+    except Exception:
+        print("=== REQUEST EXCEPTION ===")
+        traceback.print_exc()
+        raise
 
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -60,6 +73,11 @@ def home():
     return {"message": "SAP Work Order Material Trace API Running"}
 
 
+@app.get("/debug")
+def debug():
+    return {"ok": True, "message": "debug route works"}
+
+
 @app.post(
     "/api/upload",
     response_class=StreamingResponse,
@@ -77,9 +95,16 @@ async def trace_materials(
     workorder_file: UploadFile = File(..., description="工單生產檔：請上傳工單生產 Excel"),
 ):
     try:
+        print("=== ENTER /api/upload ===")
+        print(f"issue_file: {issue_file.filename}")
+        print(f"workorder_file: {workorder_file.filename}")
+
         # 1) 讀取 Excel
         issue_df = read_excel_file(issue_file)
         wo_df = read_excel_file(workorder_file)
+
+        print("issue columns:", list(issue_df.columns))
+        print("wo columns:", list(wo_df.columns))
 
         # 2) 工單耗用檔欄位
         issue_order_col = find_required_col(issue_df, "Order")
@@ -173,11 +198,7 @@ async def trace_materials(
         )
 
         # 8) 關聯
-        merged = wo_small.merge(
-            issue_small,
-            on="Order",
-            how="left",
-        )
+        merged = wo_small.merge(issue_small, on="Order", how="left")
 
         # 9) 明細表
         plant_series = merged["Plant"]
@@ -244,6 +265,10 @@ async def trace_materials(
             .sort_values(by=["Order", "Product Material Number"])
         )
 
+        print("merged rows:", len(merged_out))
+        print("summary rows:", len(trace_summary))
+        print("product_summary rows:", len(product_summary))
+
         # 12) 輸出 Excel
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -252,6 +277,7 @@ async def trace_materials(
             product_summary.to_excel(writer, index=False, sheet_name="product_summary")
 
         output.seek(0)
+        print("=== EXIT /api/upload SUCCESS ===")
 
         # 13) 回傳下載
         return StreamingResponse(
@@ -268,4 +294,4 @@ async def trace_materials(
         print("=== UNHANDLED ERROR START ===")
         traceback.print_exc()
         print("=== UNHANDLED ERROR END ===")
-        raise HTTPException(status_code=500, detail=str(e))
+        return JSONResponse(status_code=500, content={"detail": str(e)})

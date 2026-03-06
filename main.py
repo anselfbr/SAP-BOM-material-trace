@@ -4,6 +4,7 @@ from fastapi.responses import StreamingResponse
 import pandas as pd
 import io
 import re
+import traceback
 
 app = FastAPI(title="SAP Work Order Material Trace API")
 
@@ -97,7 +98,7 @@ async def trace_materials(
         wo_order_qty_col = find_required_col(wo_df, "Order quantity (GMEIN)")
         wo_delivered_qty_col = find_required_col(wo_df, "Delivered quantity (GMEIN)")
 
-        # 4) 清理 Order
+        # 4) 清理工單號
         issue_df[issue_order_col] = issue_df[issue_order_col].astype(str).str.strip()
         wo_df[wo_order_col] = wo_df[wo_order_col].astype(str).str.strip()
 
@@ -119,7 +120,7 @@ async def trace_materials(
             errors="coerce"
         )
 
-        # 6) 只保留必要欄位
+        # 6) 保留必要欄位
         issue_small = issue_df[
             [
                 issue_order_col,
@@ -147,7 +148,7 @@ async def trace_materials(
             ]
         ].copy()
 
-        # 7) 統一欄位名稱後再 merge，避免 Plant / Order suffix 問題
+        # 7) 統一欄位名稱
         issue_small = issue_small.rename(
             columns={
                 issue_order_col: "Order",
@@ -171,17 +172,21 @@ async def trace_materials(
             }
         )
 
-        # 8) 用 Order 關聯
+        # 8) 關聯
         merged = wo_small.merge(
             issue_small,
             on="Order",
             how="left",
         )
 
-        # 9) 輸出明細表
+        # 9) 明細表
+        plant_series = merged["Plant"]
+        if "Issue Plant" in merged.columns:
+            plant_series = plant_series.fillna(merged["Issue Plant"])
+
         merged_out = pd.DataFrame({
             "Order": merged["Order"],
-            "Plant": merged["Plant"].fillna(merged.get("Issue Plant")),
+            "Plant": plant_series,
             "Product Material Number": merged["Product Material Number"],
             "Product Description": merged["Product Description"],
             "工單需求數量": merged["工單需求數量"],
@@ -260,4 +265,7 @@ async def trace_materials(
     except HTTPException:
         raise
     except Exception as e:
+        print("=== UNHANDLED ERROR START ===")
+        traceback.print_exc()
+        print("=== UNHANDLED ERROR END ===")
         raise HTTPException(status_code=500, detail=str(e))

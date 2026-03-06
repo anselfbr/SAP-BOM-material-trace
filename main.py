@@ -148,9 +148,9 @@ async def trace_materials(
 
     # 8) 寫 Excel 到記憶體並回傳下載
     output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        merged_out.to_excel(writer, index=False, sheet_name="trace_detail")
-        summary.to_excel(writer, index=False, sheet_name="trace_summary")
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+    merged_out.to_excel(writer, index=False, sheet_name="trace_detail")
+    summary.to_excel(writer, index=False, sheet_name="trace_summary")
 
     output.seek(0)
     filename = "sap_bom_material_trace.xlsx"

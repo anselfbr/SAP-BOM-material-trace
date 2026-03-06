@@ -67,8 +67,8 @@ def home():
     },
 )
 async def trace_materials(
-    issue_file: UploadFile = File(..., alias="工單耗用檔", description="請上傳工單耗用 Excel"),
-    workorder_file: UploadFile = File(..., alias="工單生產檔", description="請上傳工單生產 Excel"),
+    issue_file: UploadFile = File(..., description="工單耗用檔：請上傳工單耗用 Excel"),
+    workorder_file: UploadFile = File(..., description="工單生產檔：請上傳工單生產 Excel"),
 ):
     try:
         issue_df = read_excel_file(issue_file)
@@ -76,7 +76,9 @@ async def trace_materials(
 
         issue_order_col = find_col(issue_df, ["Order", "order", "工單"])
         issue_material_col = find_col(issue_df, ["Material", "material", "原物料", "Component"])
-        issue_desc_col = find_col(issue_df, ["Material Description", "material description", "Description", "description", "物料說明"])
+        issue_desc_col = find_col(issue_df, [
+            "Material Description", "material description", "Description", "description", "物料說明"
+        ])
         issue_qty_col = find_col(issue_df, [
             "Quantity withdrawn (EINHEIT)",
             "Quantity withdrawn",
@@ -88,13 +90,29 @@ async def trace_materials(
             "耗用量",
             "需求量"
         ])
-        issue_uom_col = find_col(issue_df, ["Base Unit of Measure (=EINHEIT)", "Base Unit of Measure", "UoM", "Unit", "單位"])
+        issue_uom_col = find_col(issue_df, [
+            "Base Unit of Measure (=EINHEIT)",
+            "Base Unit of Measure",
+            "UoM",
+            "Unit",
+            "單位"
+        ])
         issue_vendor_col = find_col(issue_df, ["Vendor", "vendor", "供應商"])
         issue_plant_col = find_col(issue_df, ["Plant", "plant", "工廠"])
 
         wo_order_col = find_col(wo_df, ["Order", "order", "工單"])
-        wo_product_col = find_col(wo_df, ["Material Number", "Material number", "material number", "Material", "material", "產品料號", "成品料號"])
-        wo_product_desc_col = find_col(wo_df, ["Material Description", "material description", "Description", "description", "產品說明", "成品說明"])
+        wo_product_col = find_col(wo_df, [
+            "Material Number",
+            "Material number",
+            "material number",
+            "Material",
+            "material",
+            "產品料號",
+            "成品料號"
+        ])
+        wo_product_desc_col = find_col(wo_df, [
+            "Material Description", "material description", "Description", "description", "產品說明", "成品說明"
+        ])
         wo_plant_col = find_col(wo_df, ["Plant", "plant", "工廠"])
 
         missing = []
@@ -215,7 +233,10 @@ async def trace_materials(
         ]
 
         if not summary_group_cols:
-            raise HTTPException(status_code=500, detail=f"找不到 summary 分組欄位，現有欄位: {list(merged_out.columns)}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"找不到 summary 分組欄位，現有欄位: {list(merged_out.columns)}"
+            )
 
         if "Input Qty (num)" in merged_out.columns:
             summary = (

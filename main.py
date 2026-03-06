@@ -216,9 +216,14 @@ async def trace_materials(
         merged_out = merged.rename(columns=rename_map)
         merged_out["Input Qty (num)"] = merged_out["_qty_num"]
 
-        merged_out = merged_out.drop(
-            columns=[c for c in [issue_order_col, "_qty_num"] if c in merged_out.columns],
-            errors="ignore"
+        # 只刪除中間欄位，不要把真正的 Order 刪掉
+        drop_cols = ["_qty_num"]
+
+        # 只有在 issue_order_col 不是最終輸出的 Order 時，才刪
+        if issue_order_col != "Order" and issue_order_col in merged_out.columns:
+        drop_cols.append(issue_order_col)
+
+        merged_out = merged_out.drop(columns=drop_cols, errors="ignore")
         )
 
         # 9) 欄位順序

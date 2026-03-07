@@ -1,14 +1,19 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse
 import pandas as pd
+import os
 import io
 import re
+import uuid
+import json
 import zipfile
 import traceback
+from threading import Thread, Lock
 from collections import defaultdict
+from datetime import datetime
 
-app = FastAPI(title="SAP Work Order Material Trace API")
+app = FastAPI(title="SAP BOM Material Trace SaaS")
 
 app.add_middleware(
     CORSMiddleware,
@@ -18,6 +23,34 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "job_data")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+JOBS_FILE = os.path.join(DATA_DIR, "jobs.json")
+jobs_lock = Lock()
+
+
+def load_jobs():
+    if not os.path.exists(JOBS_FILE):
+        return {}
+    with open(JOBS_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_jobs(jobs):
+    with open(JOBS_FILE, "w", encoding="utf-8") as f:
+        json.dump(jobs, f, ensure_ascii=False, indent=2)
+
+
+def update_job(job_id, **kwargs):
+    with jobs_lock:
+        jobs = load_jobs()
+        if job_id not in jobs:
+            jobs[job_id] = {}
+        jobs[job_id].update(kwargs)
+        save_jobs(jobs)
+
 
 def normalize_columns(df: pd.DataFrame):
     df = df.copy()
@@ -25,17 +58,9 @@ def normalize_columns(df: pd.DataFrame):
     return df
 
 
-def read_excel(upload: UploadFile):
-    filename = (upload.filename or "").lower()
-
-    if not (filename.endswith(".xlsx") or filename.endswith(".xls")):
-        raise HTTPException(status_code=400, detail="請上傳 Excel 檔")
-
-    try:
-        df = pd.read_excel(upload.file, dtype=str)
-        return normalize_columns(df)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Excel 讀取失敗: {str(e)}")
+def read_excel_path(path: str):
+    df = pd.read_excel(path, dtype=str)
+    return normalize_columns(df)
 
 
 def find_col(df: pd.DataFrame, name: str) -> str:
@@ -43,7 +68,7 @@ def find_col(df: pd.DataFrame, name: str) -> str:
     key = name.strip().lower()
     if key in col_map:
         return col_map[key]
-    raise HTTPException(status_code=400, detail=f"缺少欄位 {name}")
+    raise ValueError(f"缺少欄位 {name}")
 
 
 def safe_num(series: pd.Series) -> pd.Series:
@@ -53,33 +78,14 @@ def safe_num(series: pd.Series) -> pd.Series:
     )
 
 
-@app.get("/")
-def home():
-    return {"message": "SAP Work Order Material Trace API Running"}
-
-
-@app.post(
-    "/api/upload",
-    response_class=StreamingResponse,
-    responses={
-        200: {
-            "content": {
-                "application/zip": {}
-            },
-            "description": "Download ZIP result"
-        }
-    }
-)
-async def trace_materials(
-    issue_file: UploadFile = File(..., description="工單耗用檔"),
-    workorder_file: UploadFile = File(..., description="工單生產檔")
-):
+def process_job(job_id: str, issue_path: str, workorder_path: str, output_zip_path: str):
     try:
-        # -----------------------------
-        # 1) 讀檔
-        # -----------------------------
-        issue = read_excel(issue_file)
-        wo = read_excel(workorder_file)
+        update_job(job_id, status="processing", message="讀取 Excel 中...")
+
+        issue = read_excel_path(issue_path)
+        wo = read_excel_path(workorder_path)
+
+        update_job(job_id, status="processing", message="辨識欄位中...")
 
         # 工單耗用欄位
         issue_order = find_col(issue, "Order")
@@ -106,9 +112,8 @@ async def trace_materials(
         wo["Order Qty Num"] = safe_num(wo[wo_order_qty])
         wo["Delivered Qty Num"] = safe_num(wo[wo_delivered_qty])
 
-        # -----------------------------
-        # 2) 整理第一階資料
-        # -----------------------------
+        update_job(job_id, status="processing", message="建立第一階 BOM 資料...")
+
         issue_small = issue[
             [
                 issue_order,
@@ -119,7 +124,7 @@ async def trace_materials(
                 issue_withdraw,
                 issue_uom,
                 "Requirement Qty Num",
-                "Withdrawn Qty Num"
+                "Withdrawn Qty Num",
             ]
         ].copy()
 
@@ -132,7 +137,7 @@ async def trace_materials(
                 wo_order_qty,
                 wo_delivered_qty,
                 "Order Qty Num",
-                "Delivered Qty Num"
+                "Delivered Qty Num",
             ]
         ].copy()
 
@@ -143,7 +148,7 @@ async def trace_materials(
             issue_desc: "Material Description",
             issue_req: "Requirement Qty",
             issue_withdraw: "Withdrawn Qty",
-            issue_uom: "Base Unit of Measure"
+            issue_uom: "Base Unit of Measure",
         })
 
         wo_small = wo_small.rename(columns={
@@ -152,7 +157,7 @@ async def trace_materials(
             wo_product: "Product Material Number",
             wo_prod_desc: "Product Description",
             wo_order_qty: "Order Qty",
-            wo_delivered_qty: "Delivered Qty"
+            wo_delivered_qty: "Delivered Qty",
         })
 
         merged = wo_small.merge(issue_small, on="Order", how="left")
@@ -192,9 +197,11 @@ async def trace_materials(
                 "Material Description",
                 "Requirement Qty",
                 "Withdrawn Qty",
-                "Base Unit of Measure"
+                "Base Unit of Measure",
             ]
         ].copy()
+
+        update_job(job_id, status="processing", message="建立第一階彙總...")
 
         trace_summary = (
             trace_detail
@@ -206,14 +213,14 @@ async def trace_materials(
                     "Product Material Number",
                     "Material",
                     "Material Description",
-                    "Base Unit of Measure"
+                    "Base Unit of Measure",
                 ],
                 as_index=False
             )[["Requirement Qty Num", "Withdrawn Qty Num"]]
             .sum()
             .rename(columns={
                 "Requirement Qty Num": "Requirement Qty",
-                "Withdrawn Qty Num": "Withdrawn Qty"
+                "Withdrawn Qty Num": "Withdrawn Qty",
             })
         )
 
@@ -227,34 +234,23 @@ async def trace_materials(
                     "Order Qty",
                     "Delivered Qty",
                     "Order Qty Num",
-                    "Delivered Qty Num"
+                    "Delivered Qty Num",
                 ]
             ]
             .drop_duplicates()
             .sort_values(by=["Order", "Product Material Number"])
         )
 
-        # -----------------------------
-        # 3) 建立半品集合
-        #    規則：Material 若也出現在 Product Material Number，就視為半品
-        # -----------------------------
+        update_job(job_id, status="processing", message="建立半品 map...")
+
         semifinished_set = set(
             wo_small["Product Material Number"].dropna().astype(str).str.strip().unique()
         )
 
-        # -----------------------------
-        # 4) 建立半品「每1單位」實際用料比例
-        #    全部用實際量：
-        #    Unit Actual Usage = Withdrawn Qty Num / Delivered Qty Num
-        # -----------------------------
-        bom_ratio_source = trace_detail.copy()
-
-        # 只保留有 Material、有 Product、有完工數量的資料
-        bom_ratio_source = bom_ratio_source.dropna(
+        bom_ratio_source = trace_detail.dropna(
             subset=["Plant", "Product Material Number", "Material", "Delivered Qty Num", "Withdrawn Qty Num"]
         ).copy()
 
-        # 避免除以 0
         bom_ratio_source = bom_ratio_source[
             (bom_ratio_source["Delivered Qty Num"].notna()) &
             (bom_ratio_source["Delivered Qty Num"] != 0)
@@ -268,7 +264,7 @@ async def trace_materials(
                     "Product Material Number",
                     "Material",
                     "Material Description",
-                    "Base Unit of Measure"
+                    "Base Unit of Measure",
                 ],
                 as_index=False
             )[["Withdrawn Qty Num", "Delivered Qty Num"]]
@@ -278,7 +274,6 @@ async def trace_materials(
         bom_group["Unit Actual Usage"] = bom_group["Withdrawn Qty Num"] / bom_group["Delivered Qty Num"]
         bom_group["Unit Actual Usage"] = bom_group["Unit Actual Usage"].fillna(0)
 
-        # mapping: (Plant, 半品料號) -> 下階用料列表
         bom_map = defaultdict(list)
         for _, r in bom_group.iterrows():
             key = (str(r["Plant"]).strip(), str(r["Product Material Number"]).strip())
@@ -289,9 +284,8 @@ async def trace_materials(
                 "Unit Actual Usage": 0 if pd.isna(r["Unit Actual Usage"]) else float(r["Unit Actual Usage"]),
             })
 
-        # -----------------------------
-        # 5) 遞迴展開
-        # -----------------------------
+        update_job(job_id, status="processing", message="進行多階 BOM 展開...")
+
         exploded_rows = []
 
         def explode_material(
@@ -308,31 +302,9 @@ async def trace_materials(
             parent_actual_qty: float,
             path: set
         ):
-            # 記錄本層
-            is_semifinished = current_material in semifinished_set
-
-            exploded_rows.append({
-                "Order": root_order,
-                "Plant": root_plant,
-                "Top Product Material Number": root_product,
-                "Top Product Description": root_product_desc,
-                "Level": level,
-                "Parent Material": parent_material,
-                "Parent Material Description": parent_material_desc,
-                "Material": current_material,
-                "Material Description": current_desc,
-                "Parent Actual Qty": parent_actual_qty,
-                "Unit Actual Usage": None,
-                "Exploded Actual Qty": parent_actual_qty,
-                "Base Unit of Measure": current_uom,
-                "Is SemiFinished": "Y" if is_semifinished else "N",
-            })
-
-            # 不是半品就停止
-            if not is_semifinished:
+            if current_material not in semifinished_set:
                 return
 
-            # 自己領自己 -> 停止，避免無限迴圈
             if current_material == parent_material:
                 return
 
@@ -340,11 +312,9 @@ async def trace_materials(
             if cycle_key in path:
                 return
 
-            # 找該半品的下階 BOM
             child_key = (root_plant, current_material)
             children = bom_map.get(child_key, [])
 
-            # 同 plant 找不到時，退而求其次只看料號
             if not children:
                 fallback_keys = [k for k in bom_map.keys() if k[1] == current_material]
                 if fallback_keys:
@@ -377,7 +347,6 @@ async def trace_materials(
                     "Is SemiFinished": "Y" if child["Material"] in semifinished_set else "N",
                 })
 
-                # 若下階仍是半品，繼續遞迴
                 if child["Material"] in semifinished_set and child["Material"] != current_material:
                     explode_material(
                         root_order=root_order,
@@ -394,10 +363,17 @@ async def trace_materials(
                         path=new_path
                     )
 
-        # 從第一階開始：第一階的 parent_actual_qty 就是實際領用量 Withdrawn Qty Num
         first_level = trace_detail.dropna(subset=["Material"]).copy()
 
-        for _, row in first_level.iterrows():
+        total_rows = len(first_level)
+        for idx, (_, row) in enumerate(first_level.iterrows(), start=1):
+            if idx % 5000 == 0:
+                update_job(
+                    job_id,
+                    status="processing",
+                    message=f"多階展開中... {idx}/{total_rows}"
+                )
+
             root_order = "" if pd.isna(row["Order"]) else str(row["Order"]).strip()
             root_plant = "" if pd.isna(row["Plant"]) else str(row["Plant"]).strip()
             root_product = "" if pd.isna(row["Product Material Number"]) else str(row["Product Material Number"]).strip()
@@ -411,7 +387,6 @@ async def trace_materials(
             if current_material == "":
                 continue
 
-            # 先記錄第一階
             exploded_rows.append({
                 "Order": root_order,
                 "Plant": root_plant,
@@ -429,7 +404,6 @@ async def trace_materials(
                 "Is SemiFinished": "Y" if current_material in semifinished_set else "N",
             })
 
-            # 若第一階是半品，再往下拆
             if current_material in semifinished_set:
                 explode_material(
                     root_order=root_order,
@@ -446,18 +420,17 @@ async def trace_materials(
                     path=set()
                 )
 
+        update_job(job_id, status="processing", message="整理展開結果...")
+
         bom_explosion_all_levels = pd.DataFrame(exploded_rows)
 
-        # 去掉第一階遞迴重複記錄（因為我們先 append 一次，再 explode 內又 append 一次）
         if not bom_explosion_all_levels.empty:
             bom_explosion_all_levels = bom_explosion_all_levels.drop_duplicates()
-
             bom_explosion_all_levels = bom_explosion_all_levels.sort_values(
                 by=["Order", "Top Product Material Number", "Level", "Parent Material", "Material"],
                 na_position="last"
             )
 
-        # 只保留最底層原物料
         bom_explosion_leaf_only = bom_explosion_all_levels[
             bom_explosion_all_levels["Is SemiFinished"] == "N"
         ].copy()
@@ -473,34 +446,116 @@ async def trace_materials(
                         "Top Product Description",
                         "Material",
                         "Material Description",
-                        "Base Unit of Measure"
+                        "Base Unit of Measure",
                     ],
                     as_index=False
                 )[["Exploded Actual Qty"]]
                 .sum()
             )
 
-        # -----------------------------
-        # 6) 輸出 ZIP
-        # -----------------------------
-        zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        update_job(job_id, status="processing", message="寫出結果檔...")
+
+        with zipfile.ZipFile(output_zip_path, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
             zf.writestr("trace_detail.csv", trace_detail_export.to_csv(index=False, encoding="utf-8-sig"))
             zf.writestr("trace_summary.csv", trace_summary.to_csv(index=False, encoding="utf-8-sig"))
             zf.writestr("product_summary.csv", product_summary.to_csv(index=False, encoding="utf-8-sig"))
             zf.writestr("bom_explosion_all_levels.csv", bom_explosion_all_levels.to_csv(index=False, encoding="utf-8-sig"))
             zf.writestr("bom_explosion_leaf_only.csv", bom_explosion_leaf_only.to_csv(index=False, encoding="utf-8-sig"))
 
-        zip_buffer.seek(0)
-
-        return StreamingResponse(
-            zip_buffer,
-            media_type="application/zip",
-            headers={
-                "Content-Disposition": 'attachment; filename="sap_workorder_bom_explosion_actual.zip"'
-            }
+        update_job(
+            job_id,
+            status="finished",
+            message="完成",
+            output_file=os.path.basename(output_zip_path),
+            finished_at=datetime.now().isoformat()
         )
 
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        update_job(
+            job_id,
+            status="failed",
+            message=str(e),
+            finished_at=datetime.now().isoformat()
+        )
+
+
+@app.get("/api/jobs")
+def list_jobs():
+    return load_jobs()
+
+
+@app.post("/api/upload")
+async def upload_files(
+    issue_file: UploadFile = File(..., description="工單耗用檔"),
+    workorder_file: UploadFile = File(..., description="工單生產檔")
+):
+    job_id = str(uuid.uuid4())[:8]
+    job_dir = os.path.join(DATA_DIR, job_id)
+    os.makedirs(job_dir, exist_ok=True)
+
+    issue_path = os.path.join(job_dir, issue_file.filename)
+    workorder_path = os.path.join(job_dir, workorder_file.filename)
+    output_zip_path = os.path.join(job_dir, f"{job_id}_result.zip")
+
+    with open(issue_path, "wb") as f:
+        f.write(await issue_file.read())
+
+    with open(workorder_path, "wb") as f:
+        f.write(await workorder_file.read())
+
+    update_job(
+        job_id,
+        status="queued",
+        message="已上傳，等待背景處理",
+        created_at=datetime.now().isoformat(),
+        issue_file=issue_file.filename,
+        workorder_file=workorder_file.filename,
+        output_file=None
+    )
+
+    t = Thread(
+        target=process_job,
+        args=(job_id, issue_path, workorder_path, output_zip_path),
+        daemon=True
+    )
+    t.start()
+
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "status_url": f"/api/status/{job_id}",
+        "download_url": f"/api/download/{job_id}"
+    }
+
+
+@app.get("/api/status/{job_id}")
+def job_status(job_id: str):
+    jobs = load_jobs()
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="job not found")
+    return jobs[job_id]
+
+
+@app.get("/api/download/{job_id}")
+def download_result(job_id: str):
+    jobs = load_jobs()
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="job not found")
+
+    job = jobs[job_id]
+    if job.get("status") != "finished":
+        raise HTTPException(status_code=400, detail="job not finished")
+
+    job_dir = os.path.join(DATA_DIR, job_id)
+    output_file = job.get("output_file")
+    file_path = os.path.join(job_dir, output_file)
+
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="result file not found")
+
+    return FileResponse(
+        path=file_path,
+        media_type="application/zip",
+        filename=output_file
+    )

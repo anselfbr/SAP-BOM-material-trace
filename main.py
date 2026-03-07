@@ -4,6 +4,7 @@ from fastapi.responses import StreamingResponse
 import pandas as pd
 import io
 import re
+import zipfile
 import traceback
 
 app = FastAPI(title="SAP Work Order Material Trace API")
@@ -25,7 +26,6 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 def read_excel_file(upload: UploadFile) -> pd.DataFrame:
     filename = (upload.filename or "").lower()
-
     if not (filename.endswith(".xlsx") or filename.endswith(".xls")):
         raise HTTPException(
             status_code=400,
@@ -45,7 +45,6 @@ def read_excel_file(upload: UploadFile) -> pd.DataFrame:
 def find_required_col(df: pd.DataFrame, target_name: str) -> str:
     col_map = {str(c).strip().lower(): c for c in df.columns}
     key = target_name.strip().lower()
-
     if key in col_map:
         return col_map[key]
 
@@ -66,9 +65,9 @@ def home():
     responses={
         200: {
             "content": {
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {}
+                "application/zip": {}
             },
-            "description": "Download Excel result",
+            "description": "Download ZIP result",
         }
     },
 )
@@ -97,11 +96,9 @@ async def trace_materials(
         wo_order_qty_col = find_required_col(wo_df, "Order quantity (GMEIN)")
         wo_delivered_qty_col = find_required_col(wo_df, "Delivered quantity (GMEIN)")
 
-        # 清理工單號
         issue_df[issue_order_col] = issue_df[issue_order_col].astype(str).str.strip()
         wo_df[wo_order_col] = wo_df[wo_order_col].astype(str).str.strip()
 
-        # 轉數值
         issue_df["原物料需求量(數值)"] = pd.to_numeric(
             issue_df[issue_req_qty_col].astype(str).str.replace(",", "", regex=False).str.strip(),
             errors="coerce"
@@ -119,7 +116,6 @@ async def trace_materials(
             errors="coerce"
         )
 
-        # 保留必要欄位
         issue_small = issue_df[
             [
                 issue_order_col,
@@ -147,7 +143,6 @@ async def trace_materials(
             ]
         ].copy()
 
-        # 統一欄位名稱
         issue_small = issue_small.rename(
             columns={
                 issue_order_col: "Order",
@@ -171,7 +166,6 @@ async def trace_materials(
             }
         )
 
-        # 關聯
         merged = wo_small.merge(issue_small, on="Order", how="left")
 
         plant_series = merged["Plant"]
@@ -236,19 +230,28 @@ async def trace_materials(
             .sort_values(by=["Order", "Product Material Number"])
         )
 
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine="openpyxl") as writer:
-            merged_out.to_excel(writer, index=False, sheet_name="trace_detail")
-            trace_summary.to_excel(writer, index=False, sheet_name="trace_summary")
-            product_summary.to_excel(writer, index=False, sheet_name="product_summary")
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr(
+                "trace_detail.csv",
+                merged_out.to_csv(index=False, encoding="utf-8-sig")
+            )
+            zf.writestr(
+                "trace_summary.csv",
+                trace_summary.to_csv(index=False, encoding="utf-8-sig")
+            )
+            zf.writestr(
+                "product_summary.csv",
+                product_summary.to_csv(index=False, encoding="utf-8-sig")
+            )
 
-        output.seek(0)
+        zip_buffer.seek(0)
 
         return StreamingResponse(
-            output,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            zip_buffer,
+            media_type="application/zip",
             headers={
-                "Content-Disposition": 'attachment; filename="sap_workorder_material_trace.xlsx"'
+                "Content-Disposition": 'attachment; filename="sap_workorder_material_trace.zip"'
             },
         )
 
@@ -256,4 +259,4 @@ async def trace_materials(
         raise
     except Exception:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail="Server error while generating Excel")
+        raise HTTPException(status_code=500, detail="Server error while generating ZIP")

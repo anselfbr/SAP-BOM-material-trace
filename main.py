@@ -4,6 +4,7 @@ from fastapi.responses import StreamingResponse
 import pandas as pd
 import io
 import re
+import zipfile
 import traceback
 
 app = FastAPI(title="SAP Work Order Material Trace API")
@@ -24,31 +25,24 @@ def normalize_columns(df: pd.DataFrame):
 
 
 def read_excel(upload: UploadFile):
-
     filename = (upload.filename or "").lower()
 
     if not (filename.endswith(".xlsx") or filename.endswith(".xls")):
-        raise HTTPException(status_code=400, detail="請上傳Excel")
+        raise HTTPException(status_code=400, detail="請上傳 Excel 檔")
 
     try:
         df = pd.read_excel(upload.file, dtype=str)
         return normalize_columns(df)
-
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=f"Excel 讀取失敗: {str(e)}")
 
 
-def find_col(df, name):
-
-    col_map = {c.lower(): c for c in df.columns}
-
-    if name.lower() in col_map:
-        return col_map[name.lower()]
-
-    raise HTTPException(
-        status_code=400,
-        detail=f"缺少欄位 {name}"
-    )
+def find_col(df: pd.DataFrame, name: str) -> str:
+    col_map = {str(c).strip().lower(): c for c in df.columns}
+    key = name.strip().lower()
+    if key in col_map:
+        return col_map[key]
+    raise HTTPException(status_code=400, detail=f"缺少欄位 {name}")
 
 
 @app.get("/")
@@ -56,15 +50,23 @@ def home():
     return {"message": "SAP Work Order Material Trace API Running"}
 
 
-@app.post("/api/upload")
+@app.post(
+    "/api/upload",
+    response_class=StreamingResponse,
+    responses={
+        200: {
+            "content": {
+                "application/zip": {}
+            },
+            "description": "Download ZIP result"
+        }
+    }
+)
 async def trace_materials(
-
     issue_file: UploadFile = File(...),
     workorder_file: UploadFile = File(...)
 ):
-
     try:
-
         issue = read_excel(issue_file)
         wo = read_excel(workorder_file)
 
@@ -85,31 +87,18 @@ async def trace_materials(
         wo_order_qty = find_col(wo, "Order quantity (GMEIN)")
         wo_delivered_qty = find_col(wo, "Delivered quantity (GMEIN)")
 
+        issue[issue_order] = issue[issue_order].astype(str).str.strip()
+        wo[wo_order] = wo[wo_order].astype(str).str.strip()
+
         issue_small = issue[
-            [
-                issue_order,
-                issue_plant,
-                issue_material,
-                issue_desc,
-                issue_req,
-                issue_withdraw,
-                issue_uom
-            ]
+            [issue_order, issue_plant, issue_material, issue_desc, issue_req, issue_withdraw, issue_uom]
         ].copy()
 
         wo_small = wo[
-            [
-                wo_order,
-                wo_plant,
-                wo_product,
-                wo_desc,
-                wo_order_qty,
-                wo_delivered_qty
-            ]
+            [wo_order, wo_plant, wo_product, wo_desc, wo_order_qty, wo_delivered_qty]
         ].copy()
 
         issue_small = issue_small.rename(columns={
-
             issue_order: "Order",
             issue_plant: "Issue Plant",
             issue_material: "Material",
@@ -117,24 +106,20 @@ async def trace_materials(
             issue_req: "Requirement Qty",
             issue_withdraw: "Withdrawn Qty",
             issue_uom: "Base Unit of Measure"
-
         })
 
         wo_small = wo_small.rename(columns={
-
             wo_order: "Order",
             wo_plant: "Plant",
             wo_product: "Product Material Number",
             wo_desc: "Product Description",
             wo_order_qty: "Order Qty",
             wo_delivered_qty: "Delivered Qty"
-
         })
 
         merged = wo_small.merge(issue_small, on="Order", how="left")
 
         trace_detail = pd.DataFrame({
-
             "Order": merged["Order"],
             "Plant": merged["Plant"],
             "Product Material Number": merged["Product Material Number"],
@@ -146,15 +131,20 @@ async def trace_materials(
             "Requirement Qty": merged["Requirement Qty"],
             "Withdrawn Qty": merged["Withdrawn Qty"],
             "Base Unit of Measure": merged["Base Unit of Measure"]
-
         })
 
         trace_detail = trace_detail.sort_values(
-            by=["Order", "Product Material Number", "Material"]
+            by=["Order", "Product Material Number", "Material"],
+            na_position="last"
         )
 
+        # 轉數值後 summary
+        detail_num = trace_detail.copy()
+        detail_num["Requirement Qty Num"] = pd.to_numeric(detail_num["Requirement Qty"], errors="coerce")
+        detail_num["Withdrawn Qty Num"] = pd.to_numeric(detail_num["Withdrawn Qty"], errors="coerce")
+
         trace_summary = (
-            trace_detail
+            detail_num
             .groupby(
                 [
                     "Order",
@@ -165,8 +155,12 @@ async def trace_materials(
                     "Base Unit of Measure"
                 ],
                 as_index=False
-            )[["Requirement Qty", "Withdrawn Qty"]]
+            )[["Requirement Qty Num", "Withdrawn Qty Num"]]
             .sum()
+            .rename(columns={
+                "Requirement Qty Num": "Requirement Qty",
+                "Withdrawn Qty Num": "Withdrawn Qty"
+            })
         )
 
         product_summary = (
@@ -181,32 +175,25 @@ async def trace_materials(
                 ]
             ]
             .drop_duplicates()
+            .sort_values(by=["Order", "Product Material Number"])
         )
 
-        output = io.BytesIO()
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("trace_detail.csv", trace_detail.to_csv(index=False, encoding="utf-8-sig"))
+            zf.writestr("trace_summary.csv", trace_summary.to_csv(index=False, encoding="utf-8-sig"))
+            zf.writestr("product_summary.csv", product_summary.to_csv(index=False, encoding="utf-8-sig"))
 
-        with pd.ExcelWriter(output, engine="openpyxl") as writer:
-
-            trace_detail.to_excel(writer, index=False, sheet_name="trace_detail")
-            trace_summary.to_excel(writer, index=False, sheet_name="trace_summary")
-            product_summary.to_excel(writer, index=False, sheet_name="product_summary")
-
-        output.seek(0)
+        zip_buffer.seek(0)
 
         return StreamingResponse(
-            output,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            zip_buffer,
+            media_type="application/zip",
             headers={
-                "Content-Disposition":
-                "attachment; filename=sap_workorder_material_trace.xlsx"
+                "Content-Disposition": 'attachment; filename="sap_workorder_material_trace.zip"'
             }
         )
 
     except Exception as e:
-
         traceback.print_exc()
-
-        raise HTTPException(
-            status_code=500,
-            detail=str(e)
-        )
+        raise HTTPException(status_code=500, detail=str(e))

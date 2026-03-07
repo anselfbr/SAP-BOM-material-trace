@@ -1,12 +1,10 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
 import pandas as pd
-import io
 import re
 import traceback
 
-app = FastAPI(title="SAP Work Order Material Trace API")
+app = FastAPI(title="SAP Work Order Material Trace API - Debug")
 
 app.add_middleware(
     CORSMiddleware,
@@ -15,19 +13,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# 每個 request 都印出來
-@app.middleware("http")
-async def log_requests(request: Request, call_next):
-    print(f"=== REQUEST START === {request.method} {request.url.path}")
-    try:
-        response = await call_next(request)
-        print(f"=== REQUEST END === {request.method} {request.url.path} -> {response.status_code}")
-        return response
-    except Exception:
-        print("=== REQUEST EXCEPTION ===")
-        traceback.print_exc()
-        raise
 
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -64,49 +49,35 @@ def find_required_col(df: pd.DataFrame, target_name: str) -> str:
 
     raise HTTPException(
         status_code=400,
-        detail=f"缺少必要欄位：{target_name}；實際欄位：{list(df.columns)}"
+        detail={
+            "error": f"缺少必要欄位: {target_name}",
+            "actual_columns": list(df.columns)
+        }
     )
 
 
 @app.get("/")
 def home():
-    return {"message": "SAP Work Order Material Trace API Running"}
+    return {"message": "API is running"}
 
 
-@app.get("/debug")
-def debug():
-    return {"ok": True, "message": "debug route works"}
-
-
-@app.post(
-    "/api/upload",
-    response_class=StreamingResponse,
-    responses={
-        200: {
-            "content": {
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {}
-            },
-            "description": "Download Excel result",
-        }
-    },
-)
-async def trace_materials(
-    issue_file: UploadFile = File(..., description="工單耗用檔：請上傳工單耗用 Excel"),
-    workorder_file: UploadFile = File(..., description="工單生產檔：請上傳工單生產 Excel"),
+@app.post("/api/upload")
+async def debug_upload(
+    issue_file: UploadFile = File(..., description="工單耗用檔"),
+    workorder_file: UploadFile = File(..., description="工單生產檔"),
 ):
     try:
         print("=== ENTER /api/upload ===")
-        print(f"issue_file: {issue_file.filename}")
-        print(f"workorder_file: {workorder_file.filename}")
+        print("issue_file:", issue_file.filename)
+        print("workorder_file:", workorder_file.filename)
 
-        # 1) 讀取 Excel
         issue_df = read_excel_file(issue_file)
         wo_df = read_excel_file(workorder_file)
 
         print("issue columns:", list(issue_df.columns))
-        print("wo columns:", list(wo_df.columns))
+        print("workorder columns:", list(wo_df.columns))
 
-        # 2) 工單耗用檔欄位
+        # 工單耗用檔欄位
         issue_order_col = find_required_col(issue_df, "Order")
         issue_plant_col = find_required_col(issue_df, "Plant")
         issue_material_col = find_required_col(issue_df, "Material")
@@ -115,7 +86,7 @@ async def trace_materials(
         issue_withdrawn_qty_col = find_required_col(issue_df, "Quantity withdrawn (EINHEIT)")
         issue_uom_col = find_required_col(issue_df, "Base Unit of Measure (=EINHEIT)")
 
-        # 3) 工單生產檔欄位
+        # 工單生產檔欄位
         wo_order_col = find_required_col(wo_df, "Order")
         wo_plant_col = find_required_col(wo_df, "Plant")
         wo_product_col = find_required_col(wo_df, "Material Number")
@@ -123,29 +94,7 @@ async def trace_materials(
         wo_order_qty_col = find_required_col(wo_df, "Order quantity (GMEIN)")
         wo_delivered_qty_col = find_required_col(wo_df, "Delivered quantity (GMEIN)")
 
-        # 4) 清理工單號
-        issue_df[issue_order_col] = issue_df[issue_order_col].astype(str).str.strip()
-        wo_df[wo_order_col] = wo_df[wo_order_col].astype(str).str.strip()
-
-        # 5) 轉數值
-        issue_df["原物料需求量(數值)"] = pd.to_numeric(
-            issue_df[issue_req_qty_col].astype(str).str.replace(",", "", regex=False).str.strip(),
-            errors="coerce"
-        )
-        issue_df["原物料實際耗用量(數值)"] = pd.to_numeric(
-            issue_df[issue_withdrawn_qty_col].astype(str).str.replace(",", "", regex=False).str.strip(),
-            errors="coerce"
-        )
-        wo_df["工單需求數量(數值)"] = pd.to_numeric(
-            wo_df[wo_order_qty_col].astype(str).str.replace(",", "", regex=False).str.strip(),
-            errors="coerce"
-        )
-        wo_df["實際完工數量(數值)"] = pd.to_numeric(
-            wo_df[wo_delivered_qty_col].astype(str).str.replace(",", "", regex=False).str.strip(),
-            errors="coerce"
-        )
-
-        # 6) 保留必要欄位
+        # 只做最小 merge 測試
         issue_small = issue_df[
             [
                 issue_order_col,
@@ -155,8 +104,6 @@ async def trace_materials(
                 issue_req_qty_col,
                 issue_withdrawn_qty_col,
                 issue_uom_col,
-                "原物料需求量(數值)",
-                "原物料實際耗用量(數值)",
             ]
         ].copy()
 
@@ -168,125 +115,44 @@ async def trace_materials(
                 wo_product_desc_col,
                 wo_order_qty_col,
                 wo_delivered_qty_col,
-                "工單需求數量(數值)",
-                "實際完工數量(數值)",
             ]
         ].copy()
 
-        # 7) 統一欄位名稱
-        issue_small = issue_small.rename(
-            columns={
-                issue_order_col: "Order",
-                issue_plant_col: "Issue Plant",
-                issue_material_col: "Input Material",
-                issue_material_desc_col: "Input Material Description",
-                issue_req_qty_col: "原物料需求量",
-                issue_withdrawn_qty_col: "原物料實際耗用量",
-                issue_uom_col: "UoM",
-            }
-        )
-
-        wo_small = wo_small.rename(
-            columns={
-                wo_order_col: "Order",
-                wo_plant_col: "Plant",
-                wo_product_col: "Product Material Number",
-                wo_product_desc_col: "Product Description",
-                wo_order_qty_col: "工單需求數量",
-                wo_delivered_qty_col: "實際完工數量",
-            }
-        )
-
-        # 8) 關聯
-        merged = wo_small.merge(issue_small, on="Order", how="left")
-
-        # 9) 明細表
-        plant_series = merged["Plant"]
-        if "Issue Plant" in merged.columns:
-            plant_series = plant_series.fillna(merged["Issue Plant"])
-
-        merged_out = pd.DataFrame({
-            "Order": merged["Order"],
-            "Plant": plant_series,
-            "Product Material Number": merged["Product Material Number"],
-            "Product Description": merged["Product Description"],
-            "工單需求數量": merged["工單需求數量"],
-            "工單需求數量(數值)": merged["工單需求數量(數值)"],
-            "實際完工數量": merged["實際完工數量"],
-            "實際完工數量(數值)": merged["實際完工數量(數值)"],
-            "Input Material": merged["Input Material"],
-            "Input Material Description": merged["Input Material Description"],
-            "原物料需求量": merged["原物料需求量"],
-            "原物料需求量(數值)": merged["原物料需求量(數值)"],
-            "原物料實際耗用量": merged["原物料實際耗用量"],
-            "原物料實際耗用量(數值)": merged["原物料實際耗用量(數值)"],
-            "UoM": merged["UoM"],
+        issue_small = issue_small.rename(columns={
+            issue_order_col: "Order",
+            issue_plant_col: "Issue Plant",
+            issue_material_col: "Input Material",
+            issue_material_desc_col: "Input Material Description",
+            issue_req_qty_col: "Requirement Qty",
+            issue_withdrawn_qty_col: "Withdrawn Qty",
+            issue_uom_col: "UoM",
         })
 
-        merged_out = merged_out.sort_values(
-            by=["Order", "Product Material Number", "Input Material"],
-            na_position="last"
-        )
+        wo_small = wo_small.rename(columns={
+            wo_order_col: "Order",
+            wo_plant_col: "Plant",
+            wo_product_col: "Product Material Number",
+            wo_product_desc_col: "Product Description",
+            wo_order_qty_col: "Order Qty",
+            wo_delivered_qty_col: "Delivered Qty",
+        })
 
-        # 10) 原物料彙總
-        trace_summary = (
-            merged_out
-            .dropna(subset=["Input Material"])
-            .groupby(
-                [
-                    "Order",
-                    "Plant",
-                    "Product Material Number",
-                    "Product Description",
-                    "Input Material",
-                    "Input Material Description",
-                    "UoM",
-                ],
-                as_index=False
-            )[["原物料需求量(數值)", "原物料實際耗用量(數值)"]]
-            .sum()
-        )
+        merged = wo_small.merge(issue_small, on="Order", how="left")
 
-        # 11) 成品工單彙總
-        product_summary = (
-            merged_out[
-                [
-                    "Order",
-                    "Plant",
-                    "Product Material Number",
-                    "Product Description",
-                    "工單需求數量",
-                    "工單需求數量(數值)",
-                    "實際完工數量",
-                    "實際完工數量(數值)",
-                ]
-            ]
-            .drop_duplicates()
-            .sort_values(by=["Order", "Product Material Number"])
-        )
-
-        print("merged rows:", len(merged_out))
-        print("summary rows:", len(trace_summary))
-        print("product_summary rows:", len(product_summary))
-
-        # 12) 輸出 Excel
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine="openpyxl") as writer:
-            merged_out.to_excel(writer, index=False, sheet_name="trace_detail")
-            trace_summary.to_excel(writer, index=False, sheet_name="trace_summary")
-            product_summary.to_excel(writer, index=False, sheet_name="product_summary")
-
-        output.seek(0)
+        print("merged rows:", len(merged))
         print("=== EXIT /api/upload SUCCESS ===")
 
-        # 13) 回傳下載
-        return StreamingResponse(
-            output,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={
-                "Content-Disposition": 'attachment; filename="sap_workorder_material_trace.xlsx"'
-            },
-        )
+        return {
+            "ok": True,
+            "issue_filename": issue_file.filename,
+            "workorder_filename": workorder_file.filename,
+            "issue_columns": list(issue_df.columns),
+            "workorder_columns": list(wo_df.columns),
+            "issue_rows": len(issue_df),
+            "workorder_rows": len(wo_df),
+            "merged_rows": len(merged),
+            "preview": merged.head(10).fillna("").to_dict(orient="records"),
+        }
 
     except HTTPException:
         raise
@@ -294,4 +160,4 @@ async def trace_materials(
         print("=== UNHANDLED ERROR START ===")
         traceback.print_exc()
         print("=== UNHANDLED ERROR END ===")
-        return JSONResponse(status_code=500, content={"detail": str(e)})
+        raise HTTPException(status_code=500, detail=str(e))
